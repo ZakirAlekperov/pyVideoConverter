@@ -699,8 +699,7 @@ class ConverterGUI:
     def _cancel(self):
         """Отменяет конвертирование."""
         if self.batch:
-            self._log("
-Получен запрос на отмену...")
+                    self._log("\nПолучен запрос на отмену...")
             self.batch.cancel()
             self.btn_cancel.config(state="disabled")
 
@@ -733,8 +732,8 @@ class ConverterGUI:
             color_mode = ColorMode.HDR_TO_SDR
         else:
             color_mode = ColorMode.AUTO
-
-        self._log("\n=" * 70)
+          
+        self._log("\n" + "="*70)
         self._log("НАЧАЛО КОНВЕРТИРОВАНИЯ")
         self._log(f"Профиль: {profile_str}")
         self._log(f"Цвет: {color_str}")
@@ -751,53 +750,41 @@ class ConverterGUI:
             try:
                 self._log(f"  Анализ {src.name}...")
                 job.meta = self.ffmpeg.probe(src)
-                self._log(f"    ✔ Кодек: {job.meta.codec}, {job.meta.width}x{job.meta.height}, {job.meta.fps} fps")
-                self._log(f"    ✔ Цвет: {job.meta.colorspace}/{job.meta.color_primaries}/{job.meta.color_trc}")
-
-                job.src_size_mb = src.stat().st_size / (1024*1024)
-                job.est_size_mb = self.ffmpeg.estimate_output_size(job)
-
-                # Построение команды
-                job.ffmpeg_args = self.ffmpeg.build_cmd(job, profile, color_mode)
-                jobs.append(job)
-
+                self._log(f"  ✔ Кодек: {job.meta.codec}, {job.meta.width}x{job.meta.height}, {job.meta.fps} fps")
+                self._log(f"  ✔ Цвет: {job.meta.colorspace}/{job.meta.color_primaries}/{job.meta.color_trc}")
             except Exception as e:
-                self._log(f"    ✘ Ошибка анализа: {e}")
+                self._log(f"  ✖ Ошибка анализа {src.name}: {e}")
+                messagebox.showerror("Ошибка", f"Не удалось проанализировать {src.name}: {e}")
+                return
 
-        if not jobs:
-            messagebox.showerror("Ошибка", "Не удалось подготовить ни одной задачи")
-            return
+            jobs.append(job)
 
-        # Запуск пакета
-        self.batch = BatchManager(self.ffmpeg, profile, color_mode)
-        for job in jobs:
-            self.batch.add_job(job)
+        # Обновление UI с прогрессом
+              self.progressbar["value"] = 0
+        self.lbl_progress.config(text=f"Готов: 0/{len(jobs)}", fg="blue")
 
-        # Блокировка UI
+        # Создание и запуск пакета
+        self.batch = ConversionBatch(
+            ffmpeg_wrapper=self.ffmpeg,
+            jobs=jobs,
+            profile=profile,
+            color_mode=color_mode,
+            progress_callback=self._on_progress,
+            done_callback=self._on_done,
+            finish_callback=self._finish
+        )
         self.btn_start.config(state="disabled")
         self.btn_cancel.config(state="normal")
-        self.progressbar["value"] = 0
+        self.btn_open_output.config(state="disabled")
+        self.batch.start()
 
-        # Запуск в отдельном потоке
-        thread = threading.Thread(
-            target=self.batch.run,
-            args=(self._on_progress, self._log, self._on_done),
-            daemon=True
-        )
-        thread.start()
-
-    def _on_progress(self, job: ConversionJob, percent: float):
-        """Обработчик прогресса."""
-        self.root.after(0, lambda: self._update_progress(job, percent))
-
-    def _update_progress(self, job: ConversionJob, percent: float):
-        """Обновление UI с прогрессом."""
+    def _on_progress(self, percent: float):
+        """Обновление UI с прогрессом."""  
         self.progressbar["value"] = percent
-        self.lbl_progress.config(text=f"{job.src.name}: {percent:.1f}%")
-
+        self.lbl_progress.config(text=f"Прогресс: {percent:.1f}%")
     def _on_done(self, success: bool):
         """Вызывается после завершения всех задач."""
-        self.root.after(0, lambda: self._finish(success))
+        self.root.after(0, lambda: self._finish(suПрогресс
 
     def _finish(self, success: bool):
         """Разблокировка UI после конвертирования."""
@@ -813,14 +800,15 @@ class ConverterGUI:
             messagebox.showinfo("Готово", "Конвертирование успешно завершено!")
         else:
             self._log("\n" + "="*70)
-            self._log("✘ Конвертирование отменено или завершено с ошибками")
+            self._log("✖ Конвертирование отменено или завершено с ошибками")
             self._log("="*70)
             self.lbl_progress.config(text="Отменено/Ошибка")
 
 
-# ===========================================================================
+# ========================================================================
 # ТОЧКА ВХОДА
-# ===========================================================================
+# ========================================================================
+
 def main():
     """Точка входа приложения."""
     root = tk.Tk()
@@ -830,3 +818,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
