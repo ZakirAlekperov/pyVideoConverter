@@ -1,822 +1,1089 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# Требования: Python 3.8+, tkinter (встроен в stdlib), бинарный файл ffmpeg
 """
-pyVideoConverter v1.0.0
-=======================
-Конвертер видео Canon EOS R50V -> Apple ProRes 422 HQ
+Canon EOS R50V → Apple ProRes 422 HQ Конвертер
+================================================
+Использование:
+    python converter.py
+
+Приложение предоставляет графический интерфейс для конвертации видеофайлов
+с камеры Canon EOS R50V в формат Apple ProRes 422 HQ с сохранением
+максимального качества и точности цветопередачи.
 
 Требования:
-  - Python 3.8+
-  - tkinter (входит в стандартную библиотеку Python)
-  - ffmpeg и ffprobe (https://ffmpeg.org/download.html)
-
-Запуск:
-  python converter.py
-
-Приложение автоматически определяет формат источника через ffprobe,
-строит оптимальную команду FFmpeg с правильными параметрами
-цветовой науки и выполняет пакетное конвертирование.
+    - Python 3.8+
+    - tkinter (входит в стандартную библиотеку Python)
+    - ffmpeg и ffprobe (установленные в системе или указанные вручную)
+      Скачать: https://ffmpeg.org/download.html
 """
 
+from __future__ import annotations
+
 import json
-import math
 import os
 import platform
 import queue
-import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
-import tkinter as tk
-import tkinter.font as tkfont
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Dict, List, Optional, Tuple
-
-# ===========================================================================
-# КОНСТАНТЫ
-# ===========================================================================
-APP_NAME = "pyVideoConverter — Canon EOS R50V → ProRes 422 HQ"
-VERSION = "1.0.0"
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v"}
-FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
-# Битрейт ProRes 422 HQ при 1080p25 ≈ 220 Мбит/с -> коэффициент для расчёта
-PRORes_MBPS_PER_PIXEL_PER_FPS = 220.0 / (1920 * 1080 * 25)
 
 
-# ===========================================================================
-# ПЕРЕЧИСЛЕНИЯ
-# ===========================================================================
-class ColorMode(Enum):
-    """Режим обработки цвета."""
-    AUTO = auto()               # Автоопределение
-    FORCE_REC709 = auto()       # Принудительно Rec.709
-    HDR_TO_SDR = auto()         # Тональное отображение HDR → SDR
+# ---------------------------------------------------------------------------
+# Константы
+# ---------------------------------------------------------------------------
+APP_NAME = "Canon → ProRes Конвертер"
+APP_VERSION = "1.0.0"
+SUPPORTED_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".mxf", ".MXF"}
+
+PRORES_PROFILES = {
+    "ProRes 422 Standard (профиль 2)": 2,
+    "ProRes 422 HQ (профиль 3)": 3,
+}
+
+COLOR_MODES = [
+    "Автоопределение",
+    "Принудительно Rec.709",
+    "Принудительно HDR→SDR (тонмэппинг)",
+]
+
+# Примерный битрейт ProRes 422 HQ при 1080p25 ~ 220 Мбит/с
+# Формула: bits_per_mb * mb_per_frame * fps
+# Используем упрощённую оценку: 0.36 байт на пиксель на кадр для HQ
+PRORES_BYTES_PER_PIXEL_PER_FRAME = {
+    2: 0.27,   # 422 Standard
+    3: 0.36,   # 422 HQ
+}
 
 
-class ProResProfile(Enum):
-    """Профиль ProRes."""
-    PRORES_422 = 2       # Стандартный ProRes 422
-    PRORES_422_HQ = 3    # ProRes 422 HQ (максимальное качество)
-
-
-class JobStatus(Enum):
-    """Статус задачи конвертирования."""
-    PENDING = "Ожидание"
-    RUNNING = "Конвертирование"
-    DONE = "Завершено"
-    ERROR = "Ошибка"
-    CANCELLED = "Отменено"
-
-
-# ===========================================================================
-# ДАТАКЛАССЫ
-# ===========================================================================
-@dataclass
-class StreamMetadata:
-    """Метаданные видеопотока, полученные через ffprobe."""
-    codec: str = ""
-    pix_fmt: str = ""
-    colorspace: str = ""
-    color_primaries: str = ""
-    color_trc: str = ""
-    width: int = 0
-    height: int = 0
-    fps: str = ""
-    bitrate: int = 0
-    profile: str = ""
-    tags: Dict[str, str] = field(default_factory=dict)
-    audio_codec: str = ""
-    audio_sample_rate: int = 48000
-    audio_channels: int = 2
-    duration: float = 0.0
-    nb_frames: int = 0
-
-
-@dataclass
-class ConversionJob:
-    """Одна задача конвертирования: источник → выход."""
-    src: Path
-    dst: Path
-    meta: StreamMetadata = field(default_factory=StreamMetadata)
-    ffmpeg_args: List[str] = field(default_factory=list)
-    status: JobStatus = JobStatus.PENDING
-    progress: float = 0.0
-    error_msg: str = ""
-    src_size_mb: float = 0.0
-    est_size_mb: float = 0.0
-    t_start: float = 0.0
-    t_end: float = 0.0
-
-
-# ===========================================================================
-# АНАЛИЗАТОР ЦВЕТА
-# ===========================================================================
-class ColorAnalyzer:
-    """
-    Анализирует метаданные ffprobe и возвращает стратегию обработки цвета
-    вместе с флагами FFmpeg.
-    """
-
-    CLOG3_MARKERS = {"canon log 3", "c-log3", "clog3", "canon log3"}
-
-    @staticmethod
-    def analyze(
-        meta: StreamMetadata,
-        mode: ColorMode
-    ) -> Tuple[str, List[str], List[str]]:
-        """
-        Возвращает (описание, vf_фильтры, доп_флаги).
-        vf_фильтры — список для -vf (объединяются через запятую).
-        доп_флаги — дополнительные аргументы ffmpeg (цветовые флаги).
-        """
-        if mode == ColorMode.HDR_TO_SDR:
-            return ColorAnalyzer._hdr_to_sdr()
-        if mode == ColorMode.FORCE_REC709:
-            return ColorAnalyzer._rec709()
-
-        # Режим AUTO
-        if ColorAnalyzer._detect_clog3(meta):
-            return ColorAnalyzer._clog3()
-
-        trc = meta.color_trc.lower()
-        primaries = meta.color_primaries.lower()
-        if "smpte2084" in trc or "bt2020" in primaries or "2020" in primaries:
-            return ColorAnalyzer._hdr_to_sdr()
-
-        return ColorAnalyzer._rec709()
-
-    @staticmethod
-    def _detect_clog3(meta: StreamMetadata) -> bool:
-        """Проверяет наличие Canon C-Log 3 в тегах и профиле."""
-        for v in meta.tags.values():
-            for marker in ColorAnalyzer.CLOG3_MARKERS:
-                if marker in str(v).lower():
-                    return True
-        if meta.profile:
-            for marker in ColorAnalyzer.CLOG3_MARKERS:
-                if marker in meta.profile.lower():
-                    return True
-        return False
-
-    @staticmethod
-    def _rec709() -> Tuple[str, List[str], List[str]]:
-        """Стратегия Rec.709."""
-        desc = "Rec.709 → ProRes 422 HQ (прямое копирование цветового пространства)"
-        vf: List[str] = []
-        flags = [
-            "-color_primaries", "bt709",
-            "-color_trc", "bt709",
-            "-colorspace", "bt709",
-        ]
-        return desc, vf, flags
-
-    @staticmethod
-    def _hdr_to_sdr() -> Tuple[str, List[str], List[str]]:
-        """Стратегия HDR PQ / Rec.2020 → SDR Rec.709."""
-        desc = "HDR PQ / Rec.2020 → SDR Rec.709 (тональное отображение Hable)"
-        vf = [
-            "zscale=transfer=linear:npl=100",
-            "tonemap=hable:desat=0",
-            "zscale=transfer=bt709:matrix=bt709:primaries=bt709:range=tv",
-            "format=yuv422p10le",
-        ]
-        flags = [
-            "-color_primaries", "bt709",
-            "-color_trc", "bt709",
-            "-colorspace", "bt709",
-        ]
-        return desc, vf, flags
-
-    @staticmethod
-    def _clog3() -> Tuple[str, List[str], List[str]]:
-        """Стратегия Canon C-Log 3 → Rec.709."""
-        desc = "Canon C-Log 3 → Rec.709 (расширение гаммы + преобразование цветового пространства)"
-        vf = [
-            "zscale=transfer=linear:matrixin=bt709:primariesin=bt709",
-            "tonemap=clip:desat=0",
-            "zscale=transfer=bt709:matrix=bt709:primaries=bt709:range=tv",
-            "format=yuv422p10le",
-        ]
-        flags = [
-            "-color_primaries", "bt709",
-            "-color_trc", "bt709",
-            "-colorspace", "bt709",
-        ]
-        return desc, vf, flags
-
-
-# ===========================================================================
-# ОБЁРТКА FFMPEG
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# FFmpegWrapper
+# ---------------------------------------------------------------------------
 class FFmpegWrapper:
-    """
-    Управляет бинарными файлами ffmpeg/ffprobe, разбором метаданных
-    и построением команд конвертирования.
-    """
+    """Обнаружение бинарных файлов ffmpeg/ffprobe, разбор метаданных,
+    построение команд и выполнение подпроцессов."""
 
-    DEFAULT_PATHS = {
+    COMMON_PATHS: Dict[str, List[str]] = {
         "Windows": [
-            Path("C:/ffmpeg/bin"),
-            Path("C:/Program Files/ffmpeg/bin"),
-            Path(os.path.expanduser("~")) / "ffmpeg" / "bin",
+            r"C:\ffmpeg\bin",
+            r"C:\Program Files\ffmpeg\bin",
+            r"C:\Tools\ffmpeg\bin",
         ],
         "Darwin": [
-            Path("/usr/local/bin"),
-            Path("/opt/homebrew/bin"),
-            Path("/usr/bin"),
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/opt/local/bin",
         ],
         "Linux": [
-            Path("/usr/bin"),
-            Path("/usr/local/bin"),
-            Path("/snap/bin"),
+            "/usr/bin",
+            "/usr/local/bin",
+            "/snap/bin",
         ],
     }
 
-    def __init__(self):
-        self.ffmpeg_bin: Optional[Path] = None
-        self.ffprobe_bin: Optional[Path] = None
+    def __init__(self) -> None:
+        self.ffmpeg_path: Optional[Path] = None
+        self.ffprobe_path: Optional[Path] = None
         self._find_binaries()
 
-    def _find_binaries(self):
-        """Ищет ffmpeg и ffprobe в PATH и стандартных директориях."""
+    def _find_binaries(self) -> None:
         system = platform.system()
-        suffix = ".exe" if system == "Windows" else ""
+        exe_suffix = ".exe" if system == "Windows" else ""
 
-        # Проверяем системный PATH
+        # Сначала проверяем PATH
         ffmpeg_in_path = shutil.which("ffmpeg")
         ffprobe_in_path = shutil.which("ffprobe")
 
         if ffmpeg_in_path:
-            self.ffmpeg_bin = Path(ffmpeg_in_path)
+            self.ffmpeg_path = Path(ffmpeg_in_path)
         if ffprobe_in_path:
-            self.ffprobe_bin = Path(ffprobe_in_path)
+            self.ffprobe_path = Path(ffprobe_in_path)
 
-        if self.ffmpeg_bin and self.ffprobe_bin:
+        if self.ffmpeg_path and self.ffprobe_path:
             return
 
-        # Проверяем стандартные директории
-        dirs = self.DEFAULT_PATHS.get(system, [])
-        for d in dirs:
-            ff = d / f"ffmpeg{suffix}"
-            fp = d / f"ffprobe{suffix}"
-            if not self.ffmpeg_bin and ff.is_file():
-                self.ffmpeg_bin = ff
-            if not self.ffprobe_bin and fp.is_file():
-                self.ffprobe_bin = fp
-            if self.ffmpeg_bin and self.ffprobe_bin:
+        # Проверяем стандартные пути
+        candidates = self.COMMON_PATHS.get(system, [])
+        for dir_str in candidates:
+            dir_path = Path(dir_str)
+            ff = dir_path / f"ffmpeg{exe_suffix}"
+            fp = dir_path / f"ffprobe{exe_suffix}"
+            if not self.ffmpeg_path and ff.is_file():
+                self.ffmpeg_path = ff
+            if not self.ffprobe_path and fp.is_file():
+                self.ffprobe_path = fp
+            if self.ffmpeg_path and self.ffprobe_path:
                 break
 
-    def available(self) -> bool:
-        """Возвращает True, если оба бинарных файла найдены."""
-        return bool(self.ffmpeg_bin and self.ffprobe_bin)
+    def is_available(self) -> bool:
+        return self.ffmpeg_path is not None and self.ffprobe_path is not None
 
-    def probe(self, path: Path) -> StreamMetadata:
-        """Запускает ffprobe и разбирает JSON-метаданные файла."""
-        if not self.ffprobe_bin:
-            raise RuntimeError("Ошибка: ffprobe не найден")
+    def get_missing_info(self) -> str:
+        missing = []
+        if not self.ffmpeg_path:
+            missing.append("ffmpeg")
+        if not self.ffprobe_path:
+            missing.append("ffprobe")
+        return (
+            f"Не найдены бинарные файлы: {', '.join(missing)}.\n"
+            "Скачайте ffmpeg с https://ffmpeg.org/download.html\n"
+            "и добавьте путь к бинарным файлам в системную переменную PATH."
+        )
 
+    def probe(self, file_path: Path) -> Optional[Dict]:
+        """Запускает ffprobe и возвращает словарь с метаданными в формате JSON."""
+        if not self.ffprobe_path:
+            return None
         cmd = [
-            str(self.ffprobe_bin),
+            str(self.ffprobe_path),
             "-v", "quiet",
             "-print_format", "json",
-            "-show_streams",
             "-show_format",
-            str(path),
+            "-show_streams",
+            str(file_path),
         ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Ошибка ffprobe: {result.stderr}")
-
-        data = json.loads(result.stdout)
-        meta = StreamMetadata()
-
-        # Видеопоток
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "video":
-                meta.codec = stream.get("codec_name", "")
-                meta.pix_fmt = stream.get("pix_fmt", "")
-                meta.colorspace = stream.get("color_space", "")
-                meta.color_primaries = stream.get("color_primaries", "")
-                meta.color_trc = stream.get("color_transfer", "")
-                meta.width = int(stream.get("width", 0))
-                meta.height = int(stream.get("height", 0))
-                meta.profile = stream.get("profile", "")
-                meta.tags = stream.get("tags", {})
-                # FPS
-                r = stream.get("r_frame_rate", "25/1")
-                try:
-                    num, denom = r.split("/")
-                    fps_val = float(num) / float(denom)
-                    meta.fps = f"{fps_val:.2f}"
-                except:
-                    meta.fps = "25.00"
-                # Число кадров
-                nb_str = stream.get("nb_frames", "0")
-                try:
-                    meta.nb_frames = int(nb_str)
-                except:
-                    meta.nb_frames = 0
-                break
-
-        # Аудиопоток
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "audio":
-                meta.audio_codec = stream.get("codec_name", "")
-                meta.audio_sample_rate = int(stream.get("sample_rate", 48000))
-                meta.audio_channels = int(stream.get("channels", 2))
-                break
-
-        # Длительность
-        fmt = data.get("format", {})
         try:
-            meta.duration = float(fmt.get("duration", 0.0))
-        except:
-            meta.duration = 0.0
-        try:
-            meta.bitrate = int(fmt.get("bit_rate", 0))
-        except:
-            meta.bitrate = 0
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return None
+            return json.loads(result.stdout)
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+            return None
 
-        return meta
-
-    def build_cmd(
+    def build_ffmpeg_command(
         self,
-        job: ConversionJob,
-        profile: ProResProfile,
-        color_mode: ColorMode
+        source: Path,
+        output: Path,
+        prores_profile: int,
+        color_flags: List[str],
+        vf_filter: Optional[str],
+        audio_sample_rate: int,
+        audio_channels: int,
     ) -> List[str]:
-        """Построение команды ffmpeg для конвертирования."""
-        if not self.ffmpeg_bin:
-            raise RuntimeError("Ошибка: ffmpeg не найден")
-
-        desc, vf_filters, color_flags = ColorAnalyzer.analyze(job.meta, color_mode)
-
+        """Формирует список аргументов команды ffmpeg."""
+        assert self.ffmpeg_path is not None
         cmd: List[str] = [
-            str(self.ffmpeg_bin),
-            "-y",  # Перезаписывать без запроса
-            "-i", str(job.src),
+            str(self.ffmpeg_path),
+            "-y",                 # перезапись без вопросов
+            "-i", str(source),
+            "-c:v", "prores_ks",
+            "-profile:v", str(prores_profile),
+            "-vendor", "apl0",
+            "-bits_per_mb", "8000",
         ]
 
-        # Видео
-        cmd += ["-c:v", "prores_ks"]
-        cmd += ["-profile:v", str(profile.value)]
-        cmd += ["-vendor", "apl0"]
-        cmd += ["-bits_per_mb", "8000"]
+        if vf_filter:
+            cmd += ["-vf", vf_filter]
+
         cmd += ["-pix_fmt", "yuv422p10le"]
-
-        # Фильтры
-        if vf_filters:
-            cmd += ["-vf", ",".join(vf_filters)]
-
-        # Цветовые флаги
         cmd += color_flags
 
-        # Аудио
-        cmd += ["-c:a", "pcm_s24le"]
-        cmd += ["-ar", str(job.meta.audio_sample_rate)]
+        # Сохраняем частоту кадров, разрешение и SAR точно
+        cmd += ["-fps_mode", "passthrough"]
+        cmd += ["-sws_flags", "lanczos"]
 
-        # Выход
-        cmd.append(str(job.dst))
+        # Аудио: PCM 24-bit
+        cmd += [
+            "-c:a", "pcm_s24le",
+            "-ar", str(audio_sample_rate),
+            "-ac", str(audio_channels),
+        ]
 
+        cmd += [str(output)]
         return cmd
 
-    def estimate_output_size(self, job: ConversionJob) -> float:
-        """Оценивает размер выходного файла в МБ."""
-        if job.meta.duration == 0:
-            return 0.0
-        fps = float(job.meta.fps) if job.meta.fps else 25.0
-        pixels = job.meta.width * job.meta.height
-        mbps = pixels * fps * PRORES_MBPS_PER_PIXEL_PER_FPS
-        mb_total = (mbps / 8) * job.meta.duration
-        return mb_total
-
-
-# ===========================================================================
-# МЕНЕДЖЕР ПАКЕТНОЙ ОБРАБОТКИ
-# ===========================================================================
-class BatchManager:
-    """Управляет очередью задач конвертирования."""
-
-    def __init__(self, ffmpeg: FFmpegWrapper, profile: ProResProfile, color_mode: ColorMode):
-        self.ffmpeg = ffmpeg
-        self.profile = profile
-        self.color_mode = color_mode
-        self.jobs: List[ConversionJob] = []
-        self.current_job: Optional[ConversionJob] = None
-        self.process: Optional[subprocess.Popen] = None
-        self.cancelled = False
-
-    def add_job(self, job: ConversionJob):
-        """Добавляет задачу в очередь."""
-        self.jobs.append(job)
-
-    def cancel(self):
-        """Отменяет текущую задачу."""
-        self.cancelled = True
-        if self.process:
-            if platform.system() == "Windows":
-                self.process.terminate()
-            else:
-                self.process.send_signal(signal.SIGTERM)
-
-    def run(
+    def run_conversion(
         self,
-        progress_callback: callable,
-        log_callback: callable,
-        done_callback: callable
-    ):
-        """
-        Запускает последовательное выполнение всех задач.
-        progress_callback(job, percent) — вызывается при обновлении прогресса
-        log_callback(message) — для вывода логов
-        done_callback(success) — вызывается по завершении
-        """
-        self.cancelled = False
-        success = True
+        cmd: List[str],
+        duration_seconds: float,
+        progress_callback: Callable[[float], None],
+        log_callback: Callable[[str], None],
+        cancel_event: threading.Event,
+    ) -> bool:
+        """Запускает ffmpeg, разбирает прогресс из stderr, возвращает успех."""
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            log_callback(f"Ошибка запуска ffmpeg: {exc}")
+            return False
 
-        for job in self.jobs:
-            if self.cancelled:
-                job.status = JobStatus.CANCELLED
-                log_callback(f"✘ {job.src.name}: Отменено")
+        stderr_lines: List[str] = []
+
+        def read_stderr():
+            assert process.stderr is not None
+            for line in process.stderr:
+                line = line.rstrip()
+                stderr_lines.append(line)
+                # Разбор прогресса: ffmpeg пишет "time=HH:MM:SS.ms"
+                if "time=" in line:
+                    time_str = _extract_ffmpeg_time(line)
+                    if time_str is not None and duration_seconds > 0:
+                        elapsed = _time_str_to_seconds(time_str)
+                        pct = min(elapsed / duration_seconds * 100, 99.9)
+                        progress_callback(pct)
+                elif line.strip():
+                    log_callback(line)
+
+        reader = threading.Thread(target=read_stderr, daemon=True)
+        reader.start()
+
+        # Ожидаем завершения или отмены
+        while process.poll() is None:
+            if cancel_event.is_set():
+                _terminate_process(process)
+                reader.join(timeout=3)
+                log_callback("Конвертация отменена пользователем.")
+                return False
+            time.sleep(0.1)
+
+        reader.join(timeout=5)
+        retcode = process.returncode
+
+        if retcode != 0 and not cancel_event.is_set():
+            log_callback(f"ffmpeg завершился с кодом {retcode}.")
+            # Выводим последние строки stderr для диагностики
+            for ln in stderr_lines[-10:]:
+                log_callback(ln)
+            return False
+
+        progress_callback(100.0)
+        return retcode == 0
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции для разбора ffmpeg
+# ---------------------------------------------------------------------------
+def _extract_ffmpeg_time(line: str) -> Optional[str]:
+    idx = line.find("time=")
+    if idx == -1:
+        return None
+    part = line[idx + 5:].split()[0]
+    return part
+
+
+def _time_str_to_seconds(time_str: str) -> float:
+    """Преобразует HH:MM:SS.ms в секунды."""
+    try:
+        parts = time_str.split(":")
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        return float(time_str)
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    try:
+        if platform.system() == "Windows":
+            process.terminate()
+        else:
+            process.send_signal(signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# ColorMetadataAnalyzer
+# ---------------------------------------------------------------------------
+@dataclass
+class ColorStrategy:
+    description: str
+    color_flags: List[str]
+    vf_filter: Optional[str]
+
+
+class ColorMetadataAnalyzer:
+    """Анализирует вывод ffprobe и определяет стратегию цветовой обработки."""
+
+    # Известные идентификаторы Canon C-Log3 в тегах потока
+    CLOG3_TAGS = {"Canon Log 3", "canon-log-3", "clog3", "Canon Log3"}
+
+    def analyze(
+        self,
+        probe_data: Dict,
+        force_mode: str,
+    ) -> ColorStrategy:
+        video_stream = self._get_video_stream(probe_data)
+        if video_stream is None:
+            return self._rec709_strategy()
+
+        if force_mode == "Принудительно Rec.709":
+            return self._rec709_strategy()
+
+        if force_mode == "Принудительно HDR→SDR (тонмэппинг)":
+            return self._hdr_tonemap_strategy()
+
+        # Автоопределение
+        color_trc = video_stream.get("color_trc", "")
+        color_primaries = video_stream.get("color_primaries", "")
+        colorspace = video_stream.get("color_space", "")
+        tags = video_stream.get("tags", {})
+
+        # Проверка C-Log3
+        for tag_val in tags.values():
+            if isinstance(tag_val, str) and tag_val in self.CLOG3_TAGS:
+                return self._clog3_strategy()
+
+        # Проверка HDR PQ
+        if color_trc in ("smpte2084", "arib-std-b67", "smpte428") or \
+           color_primaries in ("bt2020"):
+            return self._hdr_tonemap_strategy()
+
+        # По умолчанию Rec.709
+        return self._rec709_strategy()
+
+    def _get_video_stream(self, probe_data: Dict) -> Optional[Dict]:
+        for stream in probe_data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                return stream
+        return None
+
+    def _rec709_strategy(self) -> ColorStrategy:
+        return ColorStrategy(
+            description="Rec.709 — передача цветовых метаданных без изменений",
+            color_flags=[
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709",
+            ],
+            vf_filter=None,
+        )
+
+    def _hdr_tonemap_strategy(self) -> ColorStrategy:
+        vf = (
+            "zscale=transfer=linear,"
+            "tonemap=hable,"
+            "zscale=transfer=bt709:matrix=bt709:primaries=bt709,"
+            "format=yuv422p10le"
+        )
+        return ColorStrategy(
+            description="HDR PQ (Rec.2020) → SDR (Rec.709) тонмэппинг через zscale+hable",
+            color_flags=[
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709",
+            ],
+            vf_filter=vf,
+        )
+
+    def _clog3_strategy(self) -> ColorStrategy:
+        # Canon C-Log3: применяем colorspace с гамма-расширением
+        vf = (
+            "colorspace=iall=bt709:itrc=log316:iprimaries=bt709:"
+            "all=bt709:trc=bt709:primaries=bt709,"
+            "format=yuv422p10le"
+        )
+        return ColorStrategy(
+            description="Canon C-Log3 → Rec.709: применяется гамма-расширение colorspace",
+            color_flags=[
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709",
+            ],
+            vf_filter=vf,
+        )
+
+
+# ---------------------------------------------------------------------------
+# ConversionJob
+# ---------------------------------------------------------------------------
+@dataclass
+class ConversionJob:
+    source: Path
+    output: Path
+    probe_data: Optional[Dict]
+    color_strategy: Optional[ColorStrategy]
+    ffmpeg_cmd: List[str] = field(default_factory=list)
+    status: str = "ожидание"  # ожидание / обработка / готово / ошибка / отменено
+    error_message: str = ""
+    duration_seconds: float = 0.0
+    estimated_size_mb: float = 0.0
+
+    def format_metadata_summary(self) -> str:
+        if not self.probe_data:
+            return "Метаданные недоступны"
+        lines = [f"Источник: {self.source.name}"]
+        for stream in self.probe_data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                lines.append(
+                    f"  Видео: {stream.get('codec_name','?')} "
+                    f"{stream.get('width','?')}x{stream.get('height','?')} "
+                    f"{stream.get('r_frame_rate','?')} fps"
+                )
+                lines.append(
+                    f"  Цветовое пространство: {stream.get('color_space','?')}, "
+                    f"TRC: {stream.get('color_trc','?')}, "
+                    f"Примари: {stream.get('color_primaries','?')}"
+                )
+                lines.append(
+                    f"  Формат пикселей: {stream.get('pix_fmt','?')}, "
+                    f"Битрейт: {_format_bitrate(stream.get('bit_rate'))}"
+                )
+            elif stream.get("codec_type") == "audio":
+                lines.append(
+                    f"  Аудио: {stream.get('codec_name','?')} "
+                    f"{stream.get('sample_rate','?')} Гц, "
+                    f"{stream.get('channels','?')} кан."
+                )
+        if self.color_strategy:
+            lines.append(f"  Стратегия цвета: {self.color_strategy.description}")
+        lines.append(f"  Оценочный размер вывода: {self.estimated_size_mb:.1f} МБ")
+        return "\n".join(lines)
+
+
+def _format_bitrate(br_str: Optional[str]) -> str:
+    if not br_str:
+        return "неизвестно"
+    try:
+        br = int(br_str)
+        return f"{br // 1_000_000} Мбит/с"
+    except ValueError:
+        return br_str
+
+
+# ---------------------------------------------------------------------------
+# BatchManager
+# ---------------------------------------------------------------------------
+class BatchManager:
+    """Управляет очередью задач конвертации и выполняет их последовательно."""
+
+    def __init__(
+        self,
+        ffmpeg: FFmpegWrapper,
+        analyzer: ColorMetadataAnalyzer,
+    ) -> None:
+        self.ffmpeg = ffmpeg
+        self.analyzer = analyzer
+        self.jobs: List[ConversionJob] = []
+        self._cancel_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def prepare_jobs(
+        self,
+        sources: List[Path],
+        output_dir: Path,
+        prores_profile: int,
+        color_mode: str,
+    ) -> List[str]:
+        """Создаёт задания, запускает ffprobe, возвращает список предупреждений."""
+        self.jobs.clear()
+        warnings: List[str] = []
+
+        for src in sources:
+            probe = self.ffmpeg.probe(src)
+            if probe is None:
+                warnings.append(f"Пропущен (ошибка ffprobe): {src.name}")
                 continue
 
-            self.current_job = job
-            job.status = JobStatus.RUNNING
-            job.t_start = time.time()
-            log_callback(f"\n▶ Конвертирование: {job.src.name}")
+            video_stream = _get_video_stream(probe)
+            if video_stream is None:
+                warnings.append(f"Пропущен (видеопоток не найден): {src.name}")
+                continue
 
-            try:
-                cmd = job.ffmpeg_args
-                log_callback(f"  Команда: {' '.join(cmd)}")
+            audio_stream = _get_audio_stream(probe)
+            sample_rate = int(audio_stream.get("sample_rate", 48000)) if audio_stream else 48000
+            channels = int(audio_stream.get("channels", 2)) if audio_stream else 2
 
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
+            duration = _get_duration(probe)
+            color_strategy = self.analyzer.analyze(probe, color_mode)
+
+            output_path = output_dir / (src.stem + ".mov")
+
+            est_size = _estimate_output_size(
+                video_stream, duration, prores_profile
+            )
+
+            cmd = self.ffmpeg.build_ffmpeg_command(
+                source=src,
+                output=output_path,
+                prores_profile=prores_profile,
+                color_flags=color_strategy.color_flags,
+                vf_filter=color_strategy.vf_filter,
+                audio_sample_rate=sample_rate,
+                audio_channels=channels,
+            )
+
+            job = ConversionJob(
+                source=src,
+                output=output_path,
+                probe_data=probe,
+                color_strategy=color_strategy,
+                ffmpeg_cmd=cmd,
+                duration_seconds=duration,
+                estimated_size_mb=est_size,
+            )
+            self.jobs.append(job)
+
+        return warnings
+
+    def check_disk_space(self, output_dir: Path) -> Optional[str]:
+        total_needed = sum(j.estimated_size_mb for j in self.jobs) * 1024 * 1024
+        try:
+            free = shutil.disk_usage(output_dir).free
+            if total_needed > free * 0.95:
+                needed_gb = total_needed / 1024**3
+                free_gb = free / 1024**3
+                return (
+                    f"Недостаточно места на диске!\n"
+                    f"Требуется: ~{needed_gb:.1f} ГБ, "
+                    f"Свободно: {free_gb:.1f} ГБ"
                 )
+        except OSError:
+            pass
+        return None
 
-                # Парсинг прогресса ffmpeg
-                for line in self.process.stdout:
-                    if self.cancelled:
-                        break
-                    # ffmpeg пишет "frame=  123 fps=..." в stderr
-                    match = re.search(r'frame=\s*(\d+)', line)
-                    if match and job.meta.nb_frames > 0:
-                        frame = int(match.group(1))
-                        percent = min(100.0, 100.0 * frame / job.meta.nb_frames)
-                        job.progress = percent
-                        progress_callback(job, percent)
+    def start(
+        self,
+        job_progress_cb: Callable[[int, float], None],
+        job_done_cb: Callable[[int, bool], None],
+        batch_done_cb: Callable[[int, int], None],
+        log_cb: Callable[[str], None],
+    ) -> None:
+        self._cancel_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_all,
+            args=(job_progress_cb, job_done_cb, batch_done_cb, log_cb),
+            daemon=True,
+        )
+        self._thread.start()
 
-                self.process.wait()
-                job.t_end = time.time()
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
-                if self.cancelled:
-                    job.status = JobStatus.CANCELLED
-                    log_callback(f"✘ {job.src.name}: Отменено")
-                elif self.process.returncode == 0:
-                    job.status = JobStatus.DONE
-                    job.progress = 100.0
-                    elapsed = job.t_end - job.t_start
-                    log_callback(f"✔ {job.src.name}: Завершено за {elapsed:.1f} с")
-                    progress_callback(job, 100.0)
-                else:
-                    job.status = JobStatus.ERROR
-                    job.error_msg = f"ffmpeg завершился с кодом {self.process.returncode}"
-                    log_callback(f"✘ {job.src.name}: Ошибка — {job.error_msg}")
-                    success = False
+    def _run_all(
+        self,
+        job_progress_cb: Callable[[int, float], None],
+        job_done_cb: Callable[[int, bool], None],
+        batch_done_cb: Callable[[int, int], None],
+        log_cb: Callable[[str], None],
+    ) -> None:
+        success_count = 0
+        for idx, job in enumerate(self.jobs):
+            if self._cancel_event.is_set():
+                job.status = "отменено"
+                continue
 
-            except Exception as e:
-                job.status = JobStatus.ERROR
-                job.error_msg = str(e)
-                job.t_end = time.time()
-                log_callback(f"✘ {job.src.name}: Исключение — {e}")
-                success = False
+            job.status = "обработка"
+            log_cb(f"\n{'='*50}")
+            log_cb(f"Конвертация [{idx+1}/{len(self.jobs)}]: {job.source.name}")
+            log_cb(job.format_metadata_summary())
+            log_cb(f"Команда: {' '.join(job.ffmpeg_cmd)}")
+            log_cb(f"{'='*50}")
 
-        self.current_job = None
-        done_callback(success and not self.cancelled)
+            ok = self.ffmpeg.run_conversion(
+                cmd=job.ffmpeg_cmd,
+                duration_seconds=job.duration_seconds,
+                progress_callback=lambda pct, i=idx: job_progress_cb(i, pct),
+                log_callback=log_cb,
+                cancel_event=self._cancel_event,
+            )
+
+            if ok:
+                job.status = "готово"
+                success_count += 1
+                log_cb(f"✓ Готово: {job.output.name}")
+            elif self._cancel_event.is_set():
+                job.status = "отменено"
+            else:
+                job.status = "ошибка"
+                log_cb(f"✗ Ошибка: {job.source.name}")
+
+            job_done_cb(idx, ok)
+
+        batch_done_cb(success_count, len(self.jobs))
 
 
-# ===========================================================================
-# GUI ПРИЛОЖЕНИЯ
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
+def _get_video_stream(probe: Dict) -> Optional[Dict]:
+    for s in probe.get("streams", []):
+        if s.get("codec_type") == "video":
+            return s
+    return None
+
+
+def _get_audio_stream(probe: Dict) -> Optional[Dict]:
+    for s in probe.get("streams", []):
+        if s.get("codec_type") == "audio":
+            return s
+    return None
+
+
+def _get_duration(probe: Dict) -> float:
+    fmt = probe.get("format", {})
+    try:
+        return float(fmt.get("duration", 0))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _estimate_output_size(
+    video_stream: Dict,
+    duration_seconds: float,
+    prores_profile: int,
+) -> float:
+    """Возвращает оценочный размер файла в МБ."""
+    width = int(video_stream.get("width", 1920))
+    height = int(video_stream.get("height", 1080))
+    fps_str = video_stream.get("r_frame_rate", "25/1")
+    fps = _parse_fps(fps_str)
+    bpp = PRORES_BYTES_PER_PIXEL_PER_FRAME.get(prores_profile, 0.36)
+    total_bytes = width * height * bpp * fps * duration_seconds
+    # Добавляем 10% на аудио и метаданные
+    total_bytes *= 1.10
+    return total_bytes / (1024 * 1024)
+
+
+def _parse_fps(fps_str: str) -> float:
+    try:
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            return float(num) / float(den)
+        return float(fps_str)
+    except (ValueError, ZeroDivisionError):
+        return 25.0
+
+
+# ---------------------------------------------------------------------------
+# ConverterGUI
+# ---------------------------------------------------------------------------
 class ConverterGUI:
-    """Главное окно приложения."""
+    """Главное окно приложения на tkinter."""
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title(APP_NAME)
-        self.root.geometry("1000x750")
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
+        self.root.resizable(True, True)
+        self.root.minsize(780, 600)
 
         self.ffmpeg = FFmpegWrapper()
-        self.batch: Optional[BatchManager] = None
-        self.input_files: List[Path] = []
-        self.output_dir: Optional[Path] = None
+        self.analyzer = ColorMetadataAnalyzer()
+        self.batch_manager = BatchManager(self.ffmpeg, self.analyzer)
 
-        self._setup_ui()
+        self._gui_queue: queue.Queue = queue.Queue()
+        self._is_running = False
+
+        self._build_ui()
         self._check_ffmpeg()
+        self._poll_gui_queue()
 
-    def _setup_ui(self):
-        """Создание всех элементов интерфейса."""
-        # === ВЕРХНЯЯ ПАНЕЛЬ: ввод файлов ===
-        frame_input = ttk.LabelFrame(self.root, text="1. Выберите видеофайлы", padding=10)
-        frame_input.pack(fill="x", padx=10, pady=5)
+    # ------------------------------------------------------------------
+    # Построение интерфейса
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
-        ttk.Button(
-            frame_input, text="Добавить файлы", command=self._select_files
-        ).pack(side="left", padx=5)
-        ttk.Button(
-            frame_input, text="Добавить папку", command=self._select_folder
-        ).pack(side="left", padx=5)
-        ttk.Button(
-            frame_input, text="Очистить список", command=self._clear_input
-        ).pack(side="left", padx=5)
+        main = ttk.Frame(self.root, padding=8)
+        main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(3, weight=1)
 
-        self.lbl_input = ttk.Label(frame_input, text="Ни одного файла не выбрано", foreground="gray")
-        self.lbl_input.pack(side="left", padx=10)
+        self._build_input_section(main)
+        self._build_settings_section(main)
+        self._build_progress_section(main)
+        self._build_log_section(main)
+        self._build_action_bar(main)
 
-        # === ПАНЕЛЬ: выбор выходной папки ===
-        frame_output = ttk.LabelFrame(self.root, text="2. Выберите папку для сохранения", padding=10)
-        frame_output.pack(fill="x", padx=10, pady=5)
+    def _build_input_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Файлы источника", padding=6)
+        frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        frame.columnconfigure(1, weight=1)
 
-        ttk.Button(
-            frame_output, text="Выбрать папку", command=self._select_output_dir
-        ).pack(side="left", padx=5)
-
-        self.lbl_output = ttk.Label(frame_output, text="Не выбрана", foreground="gray")
-        self.lbl_output.pack(side="left", padx=10)
-
-        # === НАСТРОЙКИ ===
-        frame_settings = ttk.LabelFrame(self.root, text="3. Настройки", padding=10)
-        frame_settings.pack(fill="x", padx=10, pady=5)
-
-        # Профиль ProRes
-        ttk.Label(frame_settings, text="Профиль ProRes:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.var_profile = tk.StringVar(value="ProRes 422 HQ")
-        combo_profile = ttk.Combobox(
-            frame_settings,
-            textvariable=self.var_profile,
-            values=["ProRes 422", "ProRes 422 HQ"],
-            state="readonly",
-            width=20
+        ttk.Button(frame, text="Добавить файлы…", command=self._add_files).grid(
+            row=0, column=0, padx=(0, 4)
         )
-        combo_profile.grid(row=0, column=1, sticky="w", padx=5, pady=5)
-
-        # Режим обработки цвета
-        ttk.Label(frame_settings, text="Цветовое пространство:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.var_color = tk.StringVar(value="Автоопределение")
-        combo_color = ttk.Combobox(
-            frame_settings,
-            textvariable=self.var_color,
-            values=["Автоопределение", "Принудительно Rec.709", "HDR → SDR"],
-            state="readonly",
-            width=30
+        ttk.Button(frame, text="Добавить папку…", command=self._add_folder).grid(
+            row=0, column=1, sticky="w", padx=(0, 4)
         )
-        combo_color.grid(row=1, column=1, sticky="w", padx=5, pady=5)
-
-        # === КНОПКИ УПРАВЛЕНИЯ ===
-        frame_controls = ttk.Frame(self.root)
-        frame_controls.pack(fill="x", padx=10, pady=10)
-
-        self.btn_start = ttk.Button(
-            frame_controls, text="▶ Начать конвертирование", command=self._start_conversion
+        ttk.Button(frame, text="Очистить список", command=self._clear_files).grid(
+            row=0, column=2
         )
-        self.btn_start.pack(side="left", padx=5)
 
-        self.btn_cancel = ttk.Button(
-            frame_controls, text="■ Отменить", command=self._cancel, state="disabled"
+        list_frame = ttk.Frame(frame)
+        list_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        list_frame.columnconfigure(0, weight=1)
+
+        self.file_listbox = tk.Listbox(
+            list_frame, height=5, selectmode=tk.EXTENDED,
+            font=("Courier", 10), bg="#1e1e1e", fg="#d4d4d4",
+            selectbackground="#264f78"
         )
-        self.btn_cancel.pack(side="left", padx=5)
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
+        self.file_listbox.config(yscrollcommand=sb.set)
+        self.file_listbox.grid(row=0, column=0, sticky="ew")
+        sb.grid(row=0, column=1, sticky="ns")
 
-        self.btn_open_output = ttk.Button(
-            frame_controls, text="📂 Открыть папку с результатами", command=self._open_output_folder, state="disabled"
+        # Вывод папки
+        out_frame = ttk.Frame(frame)
+        out_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        out_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(out_frame, text="Папка вывода:").grid(row=0, column=0, padx=(0, 4))
+        self.output_var = tk.StringVar()
+        ttk.Entry(out_frame, textvariable=self.output_var).grid(
+            row=0, column=1, sticky="ew"
         )
-        self.btn_open_output.pack(side="right", padx=5)
+        ttk.Button(out_frame, text="Обзор…", command=self._choose_output).grid(
+            row=0, column=2, padx=(4, 0)
+        )
 
-        # === ПРОГРЕСС-БАР ===
-        frame_progress = ttk.LabelFrame(self.root, text="Прогресс", padding=10)
-        frame_progress.pack(fill="x", padx=10, pady=5)
+    def _build_settings_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Настройки конвертации", padding=6)
+        frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
 
-        self.progressbar = ttk.Progressbar(frame_progress, mode="determinate", maximum=100)
-        self.progressbar.pack(fill="x", pady=5)
+        ttk.Label(frame, text="Профиль ProRes:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.profile_var = tk.StringVar(value="ProRes 422 HQ (профиль 3)")
+        profile_cb = ttk.Combobox(
+            frame, textvariable=self.profile_var,
+            values=list(PRORES_PROFILES.keys()), state="readonly", width=36
+        )
+        profile_cb.grid(row=0, column=1, sticky="w")
 
-        self.lbl_progress = ttk.Label(frame_progress, text="Готов к работе")
-        self.lbl_progress.pack()
+        ttk.Label(frame, text="Режим цвета:").grid(
+            row=0, column=2, sticky="w", padx=(16, 8)
+        )
+        self.color_mode_var = tk.StringVar(value="Автоопределение")
+        color_cb = ttk.Combobox(
+            frame, textvariable=self.color_mode_var,
+            values=COLOR_MODES, state="readonly", width=36
+        )
+        color_cb.grid(row=0, column=3, sticky="w")
 
-        # === ЛОГ ===
-        frame_log = ttk.LabelFrame(self.root, text="Журнал событий", padding=10)
-        frame_log.pack(fill="both", expand=True, padx=10, pady=5)
+    def _build_progress_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Прогресс", padding=6)
+        frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        frame.columnconfigure(1, weight=1)
 
-        self.log_text = scrolledtext.ScrolledText(frame_log, height=15, state="disabled", wrap="word")
-        self.log_text.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Текущий файл:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.file_progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.file_progress.grid(row=0, column=1, sticky="ew")
+        self.file_progress_label = ttk.Label(frame, text="0%", width=6)
+        self.file_progress_label.grid(row=0, column=2, padx=(4, 0))
 
-    def _check_ffmpeg(self):
-        """Проверка наличия ffmpeg/ffprobe."""
-        if not self.ffmpeg.available():
-            self._log("✘ Ошибка: ffmpeg или ffprobe не найдены!")
-            self._log(f"Скачайте с {FFMPEG_DOWNLOAD_URL}")
-            messagebox.showerror(
-                "Ошибка",
-                f"ffmpeg/ffprobe не найдены.\n\n"
-                f"Скачайте и установите ffmpeg:\n{FFMPEG_DOWNLOAD_URL}"
+        ttk.Label(frame, text="Всего:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(4, 0))
+        self.batch_progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.batch_progress.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        self.batch_progress_label = ttk.Label(frame, text="0%", width=6)
+        self.batch_progress_label.grid(row=1, column=2, padx=(4, 0), pady=(4, 0))
+
+        self.status_label = ttk.Label(frame, text="Готов к работе", foreground="#888")
+        self.status_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+    def _build_log_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Журнал", padding=6)
+        frame.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        self.log_text = scrolledtext.ScrolledText(
+            frame, height=12, state=tk.DISABLED,
+            font=("Courier", 9), bg="#1e1e1e", fg="#d4d4d4",
+            wrap=tk.WORD
+        )
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+
+    def _build_action_bar(self, parent: ttk.Frame) -> None:
+        bar = ttk.Frame(parent)
+        bar.grid(row=4, column=0, sticky="ew")
+
+        self.start_btn = ttk.Button(
+            bar, text="▶  Начать конвертацию", command=self._start_conversion
+        )
+        self.start_btn.grid(row=0, column=0, padx=(0, 6))
+
+        self.cancel_btn = ttk.Button(
+            bar, text="✖  Отменить", command=self._cancel_conversion, state=tk.DISABLED
+        )
+        self.cancel_btn.grid(row=0, column=1, padx=(0, 6))
+
+        self.open_btn = ttk.Button(
+            bar, text="📂  Открыть папку вывода", command=self._open_output_folder,
+            state=tk.DISABLED
+        )
+        self.open_btn.grid(row=0, column=2)
+
+        # Информация о ffmpeg
+        self.ffmpeg_label = ttk.Label(bar, text="", foreground="#888", font=("", 8))
+        self.ffmpeg_label.grid(row=0, column=3, padx=(16, 0))
+
+    # ------------------------------------------------------------------
+    # Проверка ffmpeg
+    # ------------------------------------------------------------------
+    def _check_ffmpeg(self) -> None:
+        if self.ffmpeg.is_available():
+            self.ffmpeg_label.config(
+                text=f"ffmpeg: {self.ffmpeg.ffmpeg_path}",
+                foreground="#4ec9b0"
             )
+            self._log("ffmpeg обнаружен: " + str(self.ffmpeg.ffmpeg_path))
+            self._log("ffprobe обнаружен: " + str(self.ffmpeg.ffprobe_path))
         else:
-            self._log(f"✔ ffmpeg найден: {self.ffmpeg.ffmpeg_bin}")
-            self._log(f"✔ ffprobe найден: {self.ffmpeg.ffprobe_bin}")
+            self.ffmpeg_label.config(text="ffmpeg не найден!", foreground="#f44747")
+            self._log("ВНИМАНИЕ: " + self.ffmpeg.get_missing_info())
+            self.start_btn.config(state=tk.DISABLED)
 
-    def _log(self, msg: str):
-        """Добавляет сообщение в лог."""
-        self.log_text.config(state="normal")
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
-        self.log_text.config(state="disabled")
-
-    def _select_files(self):
-        """Открывает диалог выбора файлов."""
-        files = filedialog.askopenfilenames(
+    # ------------------------------------------------------------------
+    # Обработчики файлов
+    # ------------------------------------------------------------------
+    def _add_files(self) -> None:
+        paths = filedialog.askopenfilenames(
             title="Выберите видеофайлы",
-            filetypes=[("Video files", "*" + " *".join(VIDEO_EXTENSIONS))]
+            filetypes=[
+                ("Видеофайлы", "*.mp4 *.MP4 *.mov *.MOV *.mxf *.MXF"),
+                ("Все файлы", "*.*"),
+            ],
         )
-        for f in files:
-            p = Path(f)
-            if p.suffix.lower() in VIDEO_EXTENSIONS and p not in self.input_files:
-                self.input_files.append(p)
-        self._update_input_label()
+        for p in paths:
+            self._add_to_list(Path(p))
 
-    def _select_folder(self):
-        """Открывает диалог выбора папки с видео."""
-        folder = filedialog.askdirectory(title="Выберите папку с видео")
+    def _add_folder(self) -> None:
+        folder = filedialog.askdirectory(title="Выберите папку с видеофайлами")
         if not folder:
             return
-        for item in Path(folder).rglob("*"):
-            if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS:
-                if item not in self.input_files:
-                    self.input_files.append(item)
-        self._update_input_label()
+        folder_path = Path(folder)
+        added = 0
+        for ext in SUPPORTED_EXTENSIONS:
+            for f in folder_path.rglob(f"*{ext}"):
+                self._add_to_list(f)
+                added += 1
+        self._log(f"Добавлено файлов из папки: {added}")
 
-    def _clear_input(self):
-        """Очищает список входных файлов."""
-        self.input_files.clear()
-        self._update_input_label()
+    def _add_to_list(self, path: Path) -> None:
+        current = self.file_listbox.get(0, tk.END)
+        if str(path) not in current:
+            self.file_listbox.insert(tk.END, str(path))
 
-    def _update_input_label(self):
-        """Обновляет надпись с количеством файлов."""
-        if not self.input_files:
-            self.lbl_input.config(text="Ни одного файла не выбрано", foreground="gray")
-        else:
-            self.lbl_input.config(text=f"Выбрано файлов: {len(self.input_files)}", foreground="black")
+    def _clear_files(self) -> None:
+        self.file_listbox.delete(0, tk.END)
 
-    def _select_output_dir(self):
-        """Открывает диалог выбора выходной папки."""
-        folder = filedialog.askdirectory(title="Выберите папку для сохранения")
+    def _choose_output(self) -> None:
+        folder = filedialog.askdirectory(title="Выберите папку для сохранения файлов")
         if folder:
-            self.output_dir = Path(folder)
-            self.lbl_output.config(text=str(self.output_dir), foreground="black")
+            self.output_var.set(folder)
 
-    def _open_output_folder(self):
-        """Открывает выходную папку в проводнике."""
-        if not self.output_dir:
-            return
-        if platform.system() == "Windows":
-            os.startfile(self.output_dir)
-        elif platform.system() == "Darwin":
-            subprocess.run(["open", str(self.output_dir)])
-        else:
-            subprocess.run(["xdg-open", str(self.output_dir)])
-
-    def _cancel(self):
-        """Отменяет конвертирование."""
-        if self.batch:
-                    self._log("\nПолучен запрос на отмену...")
-            self.batch.cancel()
-            self.btn_cancel.config(state="disabled")
-
-    def _start_conversion(self):
-        """Запускает процесс конвертирования."""
-        # Проверка входных данных
-        if not self.ffmpeg.available():
-            messagebox.showerror("Ошибка", "ffmpeg/ffprobe не найдены")
+    # ------------------------------------------------------------------
+    # Конвертация
+    # ------------------------------------------------------------------
+    def _start_conversion(self) -> None:
+        if not self.ffmpeg.is_available():
+            messagebox.showerror("Ошибка", self.ffmpeg.get_missing_info())
             return
 
-        if not self.input_files:
-            messagebox.showwarning("Предупреждение", "Не выбрано ни одного файла для конвертирования")
+        sources_str = self.file_listbox.get(0, tk.END)
+        if not sources_str:
+            messagebox.showwarning("Предупреждение", "Не выбрано ни одного файла.")
             return
 
-        if not self.output_dir:
-            messagebox.showwarning("Предупреждение", "Не выбрана папка для сохранения")
+        output_str = self.output_var.get().strip()
+        if not output_str:
+            messagebox.showwarning("Предупреждение", "Не указана папка для вывода файлов.")
             return
 
-        # Определение параметров
-        profile_str = self.var_profile.get()
-        if profile_str == "ProRes 422":
-            profile = ProResProfile.PRORES_422
-        else:
-            profile = ProResProfile.PRORES_422_HQ
+        output_dir = Path(output_str)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            messagebox.showerror("Ошибка", f"Нет прав на запись в папку:\n{output_dir}")
+            return
 
-        color_str = self.var_color.get()
-        if color_str == "Принудительно Rec.709":
-            color_mode = ColorMode.FORCE_REC709
-        elif color_str == "HDR → SDR":
-            color_mode = ColorMode.HDR_TO_SDR
-        else:
-            color_mode = ColorMode.AUTO
-          
-        self._log("\n" + "="*70)
-        self._log("НАЧАЛО КОНВЕРТИРОВАНИЯ")
-        self._log(f"Профиль: {profile_str}")
-        self._log(f"Цвет: {color_str}")
-        self._log(f"Файлов: {len(self.input_files)}")
-        self._log("="*70 + "\n")
+        sources = [Path(s) for s in sources_str]
+        profile_name = self.profile_var.get()
+        prores_profile = PRORES_PROFILES.get(profile_name, 3)
+        color_mode = self.color_mode_var.get()
 
-        # Создание задач
-        jobs: List[ConversionJob] = []
-        for src in self.input_files:
-            dst = self.output_dir / f"{src.stem}_prores.mov"
-            job = ConversionJob(src=src, dst=dst)
+        self._log("\n" + "="*50)
+        self._log("Анализ файлов источника через ffprobe…")
+        warnings = self.batch_manager.prepare_jobs(
+            sources, output_dir, prores_profile, color_mode
+        )
+        for w in warnings:
+            self._log(f"⚠ {w}")
 
-            # Анализ метаданных
-            try:
-                self._log(f"  Анализ {src.name}...")
-                job.meta = self.ffmpeg.probe(src)
-                self._log(f"  ✔ Кодек: {job.meta.codec}, {job.meta.width}x{job.meta.height}, {job.meta.fps} fps")
-                self._log(f"  ✔ Цвет: {job.meta.colorspace}/{job.meta.color_primaries}/{job.meta.color_trc}")
-            except Exception as e:
-                self._log(f"  ✖ Ошибка анализа {src.name}: {e}")
-                messagebox.showerror("Ошибка", f"Не удалось проанализировать {src.name}: {e}")
+        if not self.batch_manager.jobs:
+            messagebox.showerror("Ошибка", "Ни один файл не прошёл валидацию ffprobe.")
+            return
+
+        # Вывод метаданных
+        for job in self.batch_manager.jobs:
+            self._log(job.format_metadata_summary())
+
+        # Проверка места на диске
+        disk_warn = self.batch_manager.check_disk_space(output_dir)
+        if disk_warn:
+            if not messagebox.askyesno("Предупреждение о месте", disk_warn + "\n\nПродолжить?"):
                 return
 
-            jobs.append(job)
+        total = len(self.batch_manager.jobs)
+        self.batch_progress.config(maximum=total * 100)
+        self.batch_progress["value"] = 0
 
-        # Обновление UI с прогрессом
-              self.progressbar["value"] = 0
-        self.lbl_progress.config(text=f"Готов: 0/{len(jobs)}", fg="blue")
+        self._is_running = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
+        self.open_btn.config(state=tk.DISABLED)
+        self.status_label.config(text=f"Конвертация 0/{total}…", foreground="#9cdcfe")
 
-        # Создание и запуск пакета
-        self.batch = ConversionBatch(
-            ffmpeg_wrapper=self.ffmpeg,
-            jobs=jobs,
-            profile=profile,
-            color_mode=color_mode,
-            progress_callback=self._on_progress,
-            done_callback=self._on_done,
-            finish_callback=self._finish
+        self.batch_manager.start(
+            job_progress_cb=self._on_job_progress,
+            job_done_cb=self._on_job_done,
+            batch_done_cb=self._on_batch_done,
+            log_cb=self._log_thread_safe,
         )
-        self.btn_start.config(state="disabled")
-        self.btn_cancel.config(state="normal")
-        self.btn_open_output.config(state="disabled")
-        self.batch.start()
 
-    def _on_progress(self, percent: float):
-        """Обновление UI с прогрессом."""  
-        self.progressbar["value"] = percent
-        self.lbl_progress.config(text=f"Прогресс: {percent:.1f}%")
-    def _on_done(self, success: bool):
-        """Вызывается после завершения всех задач."""
-        self.root.after(0, lambda: self._finish(suПрогресс
+    def _cancel_conversion(self) -> None:
+        self.batch_manager.cancel()
+        self.status_label.config(text="Отмена…", foreground="#f44747")
 
-    def _finish(self, success: bool):
-        """Разблокировка UI после конвертирования."""
-        self.btn_start.config(state="normal")
-        self.btn_cancel.config(state="disabled")
-        self.btn_open_output.config(state="normal")
+    # ------------------------------------------------------------------
+    # Callbacks из рабочего потока (через очередь)
+    # ------------------------------------------------------------------
+    def _on_job_progress(self, job_idx: int, pct: float) -> None:
+        self._gui_queue.put(("job_progress", job_idx, pct))
 
-        if success:
-            self._log("\n" + "="*70)
-            self._log("✔ ВСЕ ЗАДАЧИ УСПЕШНО ЗАВЕРШЕНЫ!")
-            self._log("="*70)
-            self.lbl_progress.config(text="Завершено")
-            messagebox.showinfo("Готово", "Конвертирование успешно завершено!")
-        else:
-            self._log("\n" + "="*70)
-            self._log("✖ Конвертирование отменено или завершено с ошибками")
-            self._log("="*70)
-            self.lbl_progress.config(text="Отменено/Ошибка")
+    def _on_job_done(self, job_idx: int, success: bool) -> None:
+        self._gui_queue.put(("job_done", job_idx, success))
+
+    def _on_batch_done(self, success_count: int, total: int) -> None:
+        self._gui_queue.put(("batch_done", success_count, total))
+
+    def _log_thread_safe(self, msg: str) -> None:
+        self._gui_queue.put(("log", msg))
+
+    def _poll_gui_queue(self) -> None:
+        """Опрашивает очередь GUI каждые 80 мс."""
+        try:
+            while True:
+                item = self._gui_queue.get_nowait()
+                self._handle_gui_event(item)
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(80, self._poll_gui_queue)
+
+    def _handle_gui_event(self, item: tuple) -> None:
+        event_type = item[0]
+
+        if event_type == "log":
+            self._log(item[1])
+
+        elif event_type == "job_progress":
+            _, job_idx, pct = item
+            total = len(self.batch_manager.jobs)
+            self.file_progress["value"] = pct
+            self.file_progress_label.config(text=f"{pct:.0f}%")
+            overall = job_idx * 100 + pct
+            self.batch_progress["value"] = overall
+            overall_pct = overall / (total * 100) * 100 if total else 0
+            self.batch_progress_label.config(text=f"{overall_pct:.0f}%")
+
+        elif event_type == "job_done":
+            _, job_idx, success = item
+            total = len(self.batch_manager.jobs)
+            done = job_idx + 1
+            self.status_label.config(
+                text=f"Конвертация {done}/{total}…",
+                foreground="#9cdcfe"
+            )
+
+        elif event_type == "batch_done":
+            _, success_count, total = item
+            self._is_running = False
+            self.start_btn.config(state=tk.NORMAL)
+            self.cancel_btn.config(state=tk.DISABLED)
+            self.open_btn.config(state=tk.NORMAL)
+            if success_count == total:
+                self.status_label.config(
+                    text=f"Завершено! Успешно: {success_count}/{total}",
+                    foreground="#4ec9b0"
+                )
+            else:
+                self.status_label.config(
+                    text=f"Завершено с ошибками: {success_count}/{total} успешно",
+                    foreground="#f44747"
+                )
+            self.file_progress["value"] = 100
+            self.file_progress_label.config(text="100%")
+            self.batch_progress["value"] = total * 100
+            self.batch_progress_label.config(text="100%")
+
+    # ------------------------------------------------------------------
+    # Вспомогательные методы GUI
+    # ------------------------------------------------------------------
+    def _log(self, msg: str) -> None:
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.insert(tk.END, msg + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
+
+    def _open_output_folder(self) -> None:
+        output_str = self.output_var.get().strip()
+        if not output_str:
+            return
+        path = Path(output_str)
+        if not path.exists():
+            messagebox.showwarning("Предупреждение", "Папка вывода не существует.")
+            return
+        system = platform.system()
+        try:
+            if system == "Windows":
+                os.startfile(str(path))
+            elif system == "Darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except OSError as exc:
+            messagebox.showerror("Ошибка", f"Не удалось открыть папку:\n{exc}")
 
 
-# ========================================================================
-# ТОЧКА ВХОДА
-# ========================================================================
-
-def main():
-    """Точка входа приложения."""
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+def main() -> None:
     root = tk.Tk()
+
+    # Тёмная тема
+    style = ttk.Style(root)
+    available = style.theme_names()
+    if "clam" in available:
+        style.theme_use("clam")
+
+    style.configure(".", background="#252526", foreground="#d4d4d4")
+    style.configure("TFrame", background="#252526")
+    style.configure("TLabelframe", background="#252526", foreground="#d4d4d4")
+    style.configure("TLabelframe.Label", background="#252526", foreground="#d4d4d4")
+    style.configure("TLabel", background="#252526", foreground="#d4d4d4")
+    style.configure(
+        "TButton",
+        background="#3c3c3c", foreground="#d4d4d4",
+        focusthickness=1, relief="flat"
+    )
+    style.map("TButton", background=[("active", "#505050")])
+    style.configure("TEntry", fieldbackground="#3c3c3c", foreground="#d4d4d4")
+    style.configure("TCombobox", fieldbackground="#3c3c3c", foreground="#d4d4d4")
+    style.configure("Horizontal.TProgressbar", troughcolor="#3c3c3c", background="#007acc")
+
     app = ConverterGUI(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
-
-    
